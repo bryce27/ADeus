@@ -53,6 +53,8 @@ private:
     
     void serverLoop();
     void handleClientData(const uint8_t* data, size_t len);
+    std::string buildAdvertisingData(const std::string& deviceName);
+    std::string buildScanResponseData(const std::string& deviceName);
 };
 
 #endif // BLE_SERVER_H
