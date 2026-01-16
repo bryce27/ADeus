@@ -167,6 +167,38 @@ sudo apt-get install -y bluez libbluetooth-dev
 - Ensure Bluetooth is enabled: `sudo systemctl start bluetooth`
 - Make device discoverable: `bluetoothctl discoverable on`
 
+## Running on Boot (Systemd Service)
+
+To run ADeus automatically when the Pi boots:
+
+```bash
+# Make sure it's compiled first
+./compile.sh
+
+# Install as a service (will prompt for Supabase credentials)
+sudo ./install-service.sh
+```
+
+### Service Commands
+
+```bash
+sudo systemctl start adeus      # Start now
+sudo systemctl stop adeus       # Stop
+sudo systemctl restart adeus    # Restart
+sudo systemctl status adeus     # Check status
+sudo systemctl disable adeus    # Disable auto-start
+journalctl -u adeus -f          # View live logs
+```
+
+### Updating After Code Changes
+
+```bash
+cd ~/ADeus/devices/raspizerow
+git pull
+./compile.sh
+sudo systemctl restart adeus
+```
+
 ## Architecture
 
 ```
