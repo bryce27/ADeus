@@ -88,6 +88,37 @@ Options:
 ./main --bluetooth
 ```
 
+## Voice Activity Detection (VAD)
+
+VAD intelligently detects when you're speaking and only records/sends audio with actual speech. This:
+- 📉 Reduces bandwidth usage by ~60-80%
+- 🔇 Eliminates silent recordings
+- 💾 Saves storage space
+- 🎯 Improves transcription quality
+
+### VAD Options
+
+```bash
+# VAD enabled by default
+./main
+
+# Disable VAD (record everything)
+./main --vad=false
+
+# Adjust sensitivity (lower = more sensitive)
+./main --vad-threshold 0.01
+
+# Adjust hangover (keep recording after speech ends)
+./main --vad-hangover 2000  # 2 seconds
+```
+
+### How It Works
+
+1. **Adaptive noise floor** - Learns background noise level
+2. **Energy detection** - Detects when audio exceeds noise + threshold
+3. **Hangover** - Keeps recording briefly after speech ends to avoid cutoffs
+4. **Smoothing** - Prevents rapid on/off switching
+
 ## Audio Device Configuration
 
 ### Finding Your Device

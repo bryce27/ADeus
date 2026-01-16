@@ -13,6 +13,43 @@ interface DeviceControlProps {
   supabaseToken: string;
 }
 
+// Slider component for settings
+function Slider({ 
+  label, 
+  value, 
+  min, 
+  max, 
+  step, 
+  onChange,
+  unit = ''
+}: { 
+  label: string;
+  value: number;
+  min: number;
+  max: number;
+  step: number;
+  onChange: (value: number) => void;
+  unit?: string;
+}) {
+  return (
+    <div className="space-y-1">
+      <div className="flex justify-between text-sm">
+        <span className="text-gray-600 dark:text-gray-400">{label}</span>
+        <span className="font-medium">{value}{unit}</span>
+      </div>
+      <input
+        type="range"
+        min={min}
+        max={max}
+        step={step}
+        value={value}
+        onChange={(e) => onChange(parseFloat(e.target.value))}
+        className="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer dark:bg-gray-700"
+      />
+    </div>
+  );
+}
+
 export default function DeviceControl({ supabaseUrl, supabaseToken }: DeviceControlProps) {
   const [isAvailable, setIsAvailable] = useState(false);
   const [isConnected, setIsConnected] = useState(false);
@@ -21,6 +58,12 @@ export default function DeviceControl({ supabaseUrl, supabaseToken }: DeviceCont
   const [status, setStatus] = useState<DeviceStatus | null>(null);
   const [audioChunksReceived, setAudioChunksReceived] = useState(0);
   const [isUploading, setIsUploading] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+  
+  // Local settings state
+  const [gain, setGain] = useState(1.0);
+  const [vadEnabled, setVadEnabled] = useState(true);
+  const [vadThreshold, setVadThreshold] = useState(0.02);
 
   // Check BLE availability on mount
   useEffect(() => {
@@ -316,6 +359,86 @@ export default function DeviceControl({ supabaseUrl, supabaseToken }: DeviceCont
           Uploading audio...
         </div>
       )}
+
+      {/* Settings toggle */}
+      <button
+        onClick={() => setShowSettings(!showSettings)}
+        className="mt-3 flex w-full items-center justify-center text-sm text-gray-500 hover:text-gray-700 dark:hover:text-gray-300"
+      >
+        <SettingsIcon className="mr-1 h-4 w-4" />
+        {showSettings ? 'Hide Settings' : 'Show Settings'}
+      </button>
+
+      {/* Settings panel */}
+      {showSettings && (
+        <div className="mt-3 space-y-4 rounded-lg bg-gray-50 p-3 dark:bg-gray-800">
+          {/* Gain control */}
+          <Slider
+            label="Microphone Gain"
+            value={gain}
+            min={0.5}
+            max={3.0}
+            step={0.1}
+            unit="x"
+            onChange={async (val) => {
+              setGain(val);
+              try {
+                await bleService.setGain(val);
+              } catch (e) {
+                console.error('Failed to set gain:', e);
+              }
+            }}
+          />
+
+          {/* VAD toggle */}
+          <div className="flex items-center justify-between">
+            <div>
+              <div className="text-sm font-medium">Voice Activity Detection</div>
+              <div className="text-xs text-gray-500">Only record when speech is detected</div>
+            </div>
+            <button
+              onClick={async () => {
+                const newValue = !vadEnabled;
+                setVadEnabled(newValue);
+                try {
+                  await bleService.setVADEnabled(newValue);
+                  toast.success(`VAD ${newValue ? 'enabled' : 'disabled'}`);
+                } catch (e) {
+                  console.error('Failed to set VAD:', e);
+                }
+              }}
+              className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                vadEnabled ? 'bg-green-500' : 'bg-gray-300'
+              }`}
+            >
+              <span
+                className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                  vadEnabled ? 'translate-x-6' : 'translate-x-1'
+                }`}
+              />
+            </button>
+          </div>
+
+          {/* VAD threshold */}
+          {vadEnabled && (
+            <Slider
+              label="VAD Sensitivity"
+              value={vadThreshold}
+              min={0.005}
+              max={0.1}
+              step={0.005}
+              onChange={async (val) => {
+                setVadThreshold(val);
+                try {
+                  await bleService.setVADThreshold(val);
+                } catch (e) {
+                  console.error('Failed to set VAD threshold:', e);
+                }
+              }}
+            />
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -359,6 +482,15 @@ function StopIcon({ className }: { className?: string }) {
     <svg className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor">
       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 10a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1h-4a1 1 0 01-1-1v-4z" />
+    </svg>
+  );
+}
+
+function SettingsIcon({ className }: { className?: string }) {
+  return (
+    <svg className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
     </svg>
   );
 }

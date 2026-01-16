@@ -45,5 +45,13 @@
 	</array>
 	<key>UIViewControllerBasedStatusBarAppearance</key>
 	<true/>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>ADeus uses Bluetooth to connect to your recording device for audio streaming and remote control.</string>
+	<key>NSBluetoothPeripheralUsageDescription</key>
+	<string>ADeus uses Bluetooth to connect to your recording device.</string>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>bluetooth-central</string>
+	</array>
 </dict>
 </plist>

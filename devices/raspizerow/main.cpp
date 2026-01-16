@@ -16,7 +16,11 @@
 // Optional Bluetooth support (compile with -DENABLE_BLUETOOTH and link libbluetooth)
 #ifdef ENABLE_BLUETOOTH
 #include "bluetooth/ble_server.h"
+#include "bluetooth/ble_protocol.h"
 #endif
+
+// Voice Activity Detection
+#include "vad/voice_activity_detector.h"
 
 #define DO_NOT_APPLY_GAIN 1.0
 
@@ -32,11 +36,22 @@ struct Config {
     bool useBluetooth = false;
     bool verbose = false;
     int retentionDays = 7;  // Keep audio files for N days
+    
+    // Voice Activity Detection
+    bool vadEnabled = true;
+    float vadThreshold = 0.02f;
+    int vadHangoverMs = 1500;  // Keep recording for 1.5s after speech ends
 };
 
 Config config;
 std::atomic<bool> running{true};
+std::atomic<bool> recordingPaused{false};
 int rc;
+
+// Voice Activity Detector instance
+VoiceActivityDetector vad;
+std::atomic<int> vadSilenceCount{0};
+std::atomic<int> vadSpeechCount{0};
 
 // Signal handler for graceful shutdown
 void signalHandler(int signum) {
@@ -95,9 +110,27 @@ void recordAudio(snd_pcm_t *capture_handle, snd_pcm_uframes_t period_size)
     int targetBytes = config.sampleRate * config.durationInSeconds * config.bytesPerSample * config.channels;
     std::vector<char> buffer(period_size * config.bytesPerSample);
     std::vector<char> accumulatedBuffer;
+    std::vector<char> vadBuffer;  // Buffer audio during VAD detection
+    
+    // Configure VAD based on settings
+    vad.setEnabled(config.vadEnabled);
+    vad.setThreshold(config.vadThreshold);
+    // Convert hangover from ms to frames
+    int hangoverFrames = (config.vadHangoverMs * config.sampleRate) / (1000 * period_size);
+    vad.setHangover(hangoverFrames);
+    
+    bool wasActive = false;
+    int silentChunks = 0;
+    const int maxSilentChunks = 3;  // Send after this many silent chunks if we have data
 
     while (running)
     {
+        // Check if paused (from Bluetooth command)
+        if (recordingPaused) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
+        }
+        
         rc = snd_pcm_readi(capture_handle, buffer.data(), period_size);
         if (rc == -EPIPE)
         {
@@ -117,18 +150,72 @@ void recordAudio(snd_pcm_t *capture_handle, snd_pcm_uframes_t period_size)
         }
         else
         {
-            accumulatedBuffer.insert(accumulatedBuffer.end(), buffer.begin(), 
-                                     buffer.begin() + rc * config.bytesPerSample * config.channels);
+            size_t bytesRead = rc * config.bytesPerSample * config.channels;
+            
+            // Run Voice Activity Detection
+            bool isActive = vad.process(buffer.data(), bytesRead, config.bytesPerSample);
+            
+            if (config.vadEnabled) {
+                if (isActive) {
+                    vadSpeechCount++;
+                    silentChunks = 0;
+                    
+                    // Add to accumulated buffer
+                    accumulatedBuffer.insert(accumulatedBuffer.end(), 
+                                            buffer.begin(), buffer.begin() + bytesRead);
+                    
+                    if (!wasActive && config.verbose) {
+                        std::cout << "VAD: Speech detected (noise floor: " 
+                                  << vad.getNoiseFloor() << ")" << std::endl;
+                    }
+                    wasActive = true;
+                } else {
+                    vadSilenceCount++;
+                    silentChunks++;
+                    
+                    // If we were active and now silent, might still want to send
+                    if (wasActive) {
+                        // Include a bit of trailing silence
+                        if (silentChunks <= 2) {
+                            accumulatedBuffer.insert(accumulatedBuffer.end(),
+                                                    buffer.begin(), buffer.begin() + bytesRead);
+                        }
+                        
+                        // After enough silence, send what we have
+                        if (silentChunks >= maxSilentChunks && !accumulatedBuffer.empty()) {
+                            if (config.verbose) {
+                                std::cout << "VAD: Sending " << accumulatedBuffer.size() 
+                                          << " bytes after speech ended" << std::endl;
+                            }
+                            audioQueue.push(accumulatedBuffer);
+                            accumulatedBuffer.clear();
+                            wasActive = false;
+                        }
+                    }
+                }
+            } else {
+                // VAD disabled, accumulate everything
+                accumulatedBuffer.insert(accumulatedBuffer.end(), 
+                                        buffer.begin(), buffer.begin() + bytesRead);
+            }
 
+            // Send when we hit target size
             if (accumulatedBuffer.size() >= static_cast<size_t>(targetBytes))
             {
                 audioQueue.push(accumulatedBuffer);
                 accumulatedBuffer.clear();
+                wasActive = false;
                 if (config.verbose) {
-                    std::cout << "Audio chunk ready for sending" << std::endl;
+                    std::cout << "Audio chunk ready for sending (" 
+                              << targetBytes << " bytes)" << std::endl;
                 }
             }
         }
+    }
+    
+    // Send any remaining audio on shutdown
+    if (!accumulatedBuffer.empty()) {
+        audioQueue.push(accumulatedBuffer);
     }
 }
 
@@ -387,6 +474,9 @@ Config process_args(int argc, char *argv[])
         ("r,rate", "Sample rate in Hz (default: 44100)", cxxopts::value<unsigned int>())
         ("t,duration", "Recording duration per chunk in seconds (default: 60)", cxxopts::value<int>())
         ("retention", "Days to keep audio files before auto-delete (default: 7)", cxxopts::value<int>())
+        ("vad", "Enable Voice Activity Detection (default: on)", cxxopts::value<bool>()->default_value("true"))
+        ("vad-threshold", "VAD sensitivity threshold 0.0-1.0 (default: 0.02)", cxxopts::value<float>())
+        ("vad-hangover", "Keep recording for N ms after speech ends (default: 1500)", cxxopts::value<int>())
 #ifdef ENABLE_BLUETOOTH
         ("b,bluetooth", "Use Bluetooth LE instead of WiFi")
 #endif
@@ -435,6 +525,17 @@ Config process_args(int argc, char *argv[])
         cfg.retentionDays = result["retention"].as<int>();
     }
 
+    // VAD options
+    if (result.count("vad")) {
+        cfg.vadEnabled = result["vad"].as<bool>();
+    }
+    if (result.count("vad-threshold")) {
+        cfg.vadThreshold = result["vad-threshold"].as<float>();
+    }
+    if (result.count("vad-hangover")) {
+        cfg.vadHangoverMs = result["vad-hangover"].as<int>();
+    }
+
 #ifdef ENABLE_BLUETOOTH
     if (result.count("bluetooth")) {
         cfg.useBluetooth = true;
@@ -465,6 +566,12 @@ int main(int argc, char *argv[])
     std::cout << "  Audio gain:      " << config.audioGain << "x" << std::endl;
     std::cout << "  Save locally:    yes (in data/ directory)" << std::endl;
     std::cout << "  Retention:       " << config.retentionDays << " days" << std::endl;
+    std::cout << "  VAD:             " << (config.vadEnabled ? "enabled" : "disabled");
+    if (config.vadEnabled) {
+        std::cout << " (threshold: " << config.vadThreshold 
+                  << ", hangover: " << config.vadHangoverMs << "ms)";
+    }
+    std::cout << std::endl;
 #ifdef ENABLE_BLUETOOTH
     std::cout << "  Mode:            " << (config.useBluetooth ? "Bluetooth LE" : "WiFi/HTTP") << std::endl;
 #else
