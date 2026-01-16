@@ -301,12 +301,12 @@ int main(int argc, char *argv[])
     snd_pcm_t *capture_handle;
     snd_pcm_format_t format = SND_PCM_FORMAT_S32_LE;
 
-    // Open PCM device for recording
-    rc = snd_pcm_open(&capture_handle, "default", SND_PCM_STREAM_CAPTURE, 0);
-    assert(rc >= 0);
+    // Open PCM device for recording (use plughw:1,0 for USB mic)
+    rc = snd_pcm_open(&capture_handle, "plughw:1,0", SND_PCM_STREAM_CAPTURE, 0);
     if (rc < 0)
     {
         std::cerr << "Unable to open pcm device: " << snd_strerror(rc) << std::endl;
+        std::cerr << "Tip: Run 'arecord -l' to list available devices" << std::endl;
         return 1;
     }
 
