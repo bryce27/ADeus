@@ -1,10 +1,12 @@
 import os
+import glob
 import threading
 import pyaudio
 import wave
 import numpy as np
 import time
 import signal
+from datetime import datetime, timedelta
 
 import requests
 import logging
@@ -23,7 +25,9 @@ parser.add_argument('-s', '--seconds', type=int, default=30,
                     help="Duration of each recording segment in seconds. (default 30)")
 parser.add_argument('-m', '--sensitivity', type=float, default=0.0,
                     help="Microphone sensitivity threshold (0.0 to 100.0, default: 0).")
-parser.add_argument('-l', '--save', action='store_true', help="Save recordings locally.")
+parser.add_argument('-l', '--save', action='store_true', help="(Deprecated: recordings are always saved locally)")
+parser.add_argument('-r', '--retention', type=int, default=7,
+                    help="Days to keep audio files before auto-delete (default: 7)")
 parser.add_argument('-v', '--verbose', action='store_true',
                     help="Enable verbose output for debugging.")
 
@@ -60,11 +64,39 @@ def is_silent(data_chunk):
 
 
 def get_wav_filename():
-    return WAVE_OUTPUT_FILENAME.format(int(time.time()) if args.save else '')
+    # Always save files locally with timestamp
+    return WAVE_OUTPUT_FILENAME.format(int(time.time()))
 
 
 def get_base_url():
     return args.base_url if not args.base_url.endswith('/') else args.base_url[:-1]
+
+
+def cleanup_old_audio_files():
+    """Delete audio files older than retention days."""
+    cutoff_time = time.time() - (args.retention * 24 * 60 * 60)
+    deleted_count = 0
+    
+    for filepath in glob.glob('recording*.wav'):
+        try:
+            file_mtime = os.path.getmtime(filepath)
+            if file_mtime < cutoff_time:
+                os.remove(filepath)
+                deleted_count += 1
+                logger.debug(f'Deleted old file: {filepath}')
+        except Exception as e:
+            logger.error(f'Failed to delete {filepath}: {e}')
+    
+    if deleted_count > 0:
+        logger.info(f'Cleanup: deleted {deleted_count} audio file(s) older than {args.retention} days')
+
+
+def cleanup_thread():
+    """Background thread for periodic cleanup."""
+    while True:
+        cleanup_old_audio_files()
+        # Run cleanup every hour
+        time.sleep(3600)
 
 
 def store_sound(frames):
@@ -76,6 +108,8 @@ def store_sound(frames):
     wf.setframerate(RATE)
     wf.writeframes(b''.join(frames))
     wf.close()
+    
+    logger.info(f'Saved audio file locally: {filename}')
 
     with open(filename, 'rb') as f:
         files = {'file': (filename, f, 'audio/wav')}
@@ -92,7 +126,16 @@ Starting ADeus sound recording,
     - Use --help for help.
     - Running with URL: "{get_base_url()}"
     - Recordings length: {args.seconds} seconds.
+    - Retention: {args.retention} days
     """)
+    
+    # Run initial cleanup of old files
+    cleanup_old_audio_files()
+    
+    # Start background cleanup thread
+    cleanup = threading.Thread(target=cleanup_thread, daemon=True)
+    cleanup.start()
+    
     # Prepare to record
     stream = audio.open(format=FORMAT, channels=CHANNELS,
                         rate=RATE, input=True,
@@ -103,8 +146,7 @@ Starting ADeus sound recording,
         stream.stop_stream()
         stream.close()
         audio.terminate()
-        if not args.save:
-            os.remove(get_wav_filename())
+        # Audio files are kept locally (not deleted)
         exit(0)
 
     signal.signal(signal.SIGINT, exit_script)

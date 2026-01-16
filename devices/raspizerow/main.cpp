@@ -31,6 +31,7 @@ struct Config {
     bool saveToLocalFile = false;
     bool useBluetooth = false;
     bool verbose = false;
+    int retentionDays = 7;  // Keep audio files for N days
 };
 
 Config config;
@@ -178,6 +179,57 @@ void saveWavToFile(const std::vector<char> &buffer)
     }
 }
 
+// Delete audio files older than retentionDays
+void cleanupOldAudioFiles()
+{
+    if (!std::filesystem::exists("data")) {
+        return;
+    }
+
+    auto now = std::chrono::system_clock::now();
+    auto cutoffTime = now - std::chrono::hours(24 * config.retentionDays);
+    int deletedCount = 0;
+    
+    for (const auto& entry : std::filesystem::directory_iterator("data")) {
+        if (entry.is_regular_file() && entry.path().extension() == ".wav") {
+            auto fileTime = std::filesystem::last_write_time(entry);
+            // Convert file_time_type to system_clock time_point
+            auto sctp = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+                fileTime - std::filesystem::file_time_type::clock::now() + std::chrono::system_clock::now()
+            );
+            
+            if (sctp < cutoffTime) {
+                try {
+                    std::filesystem::remove(entry.path());
+                    deletedCount++;
+                    if (config.verbose) {
+                        std::cout << "Deleted old file: " << entry.path() << std::endl;
+                    }
+                } catch (const std::exception& e) {
+                    std::cerr << "Failed to delete " << entry.path() << ": " << e.what() << std::endl;
+                }
+            }
+        }
+    }
+    
+    if (deletedCount > 0) {
+        std::cout << "Cleanup: deleted " << deletedCount << " audio file(s) older than " 
+                  << config.retentionDays << " days" << std::endl;
+    }
+}
+
+// Background thread for periodic cleanup
+void cleanupThread()
+{
+    while (running) {
+        cleanupOldAudioFiles();
+        // Run cleanup every hour
+        for (int i = 0; i < 3600 && running; i++) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+    }
+}
+
 void sendWavBufferHTTP(const std::vector<char> &buffer)
 {
     const char *supabaseUrlEnv = getenv("SUPABASE_URL");
@@ -250,9 +302,8 @@ void sendWavBufferBLE(const std::vector<char> &buffer)
 
 void sendWavBuffer(const std::vector<char> &buffer)
 {
-    if (config.saveToLocalFile) {
-        saveWavToFile(buffer);
-    }
+    // Always save audio files locally on the Pi
+    saveWavToFile(buffer);
 
 #ifdef ENABLE_BLUETOOTH
     if (config.useBluetooth) {
@@ -335,6 +386,7 @@ Config process_args(int argc, char *argv[])
         ("d,device", "ALSA audio device (default: plughw:1,0)", cxxopts::value<std::string>())
         ("r,rate", "Sample rate in Hz (default: 44100)", cxxopts::value<unsigned int>())
         ("t,duration", "Recording duration per chunk in seconds (default: 60)", cxxopts::value<int>())
+        ("retention", "Days to keep audio files before auto-delete (default: 7)", cxxopts::value<int>())
 #ifdef ENABLE_BLUETOOTH
         ("b,bluetooth", "Use Bluetooth LE instead of WiFi")
 #endif
@@ -379,6 +431,10 @@ Config process_args(int argc, char *argv[])
         cfg.durationInSeconds = result["duration"].as<int>();
     }
 
+    if (result.count("retention")) {
+        cfg.retentionDays = result["retention"].as<int>();
+    }
+
 #ifdef ENABLE_BLUETOOTH
     if (result.count("bluetooth")) {
         cfg.useBluetooth = true;
@@ -407,7 +463,8 @@ int main(int argc, char *argv[])
     std::cout << "  Sample rate:     " << config.sampleRate << " Hz" << std::endl;
     std::cout << "  Chunk duration:  " << config.durationInSeconds << " seconds" << std::endl;
     std::cout << "  Audio gain:      " << config.audioGain << "x" << std::endl;
-    std::cout << "  Save locally:    " << (config.saveToLocalFile ? "yes" : "no") << std::endl;
+    std::cout << "  Save locally:    yes (in data/ directory)" << std::endl;
+    std::cout << "  Retention:       " << config.retentionDays << " days" << std::endl;
 #ifdef ENABLE_BLUETOOTH
     std::cout << "  Mode:            " << (config.useBluetooth ? "Bluetooth LE" : "WiFi/HTTP") << std::endl;
 #else
@@ -466,9 +523,13 @@ int main(int argc, char *argv[])
     std::cout << "Recording started! Press Ctrl+C to stop." << std::endl;
     std::cout << std::endl;
 
+    // Run initial cleanup of old files
+    cleanupOldAudioFiles();
+
     // Start threads
     std::thread recordingThread(recordAudio, capture_handle, period_size);
     std::thread sendingThread(handleAudioBuffer);
+    std::thread cleanupThreadHandle(cleanupThread);
 
     // Wait for threads
     recordingThread.join();
@@ -476,6 +537,7 @@ int main(int argc, char *argv[])
     // Wake up the sending thread
     audioQueue.notify_all();
     sendingThread.join();
+    cleanupThreadHandle.join();
 
     // Cleanup
     snd_pcm_drop(capture_handle);

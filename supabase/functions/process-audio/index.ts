@@ -17,7 +17,7 @@ const processAudio = async (req: Request) => {
 
   const contentType = req.headers.get('Content-Type') || '';
     let arrayBuffer: ArrayBuffer;
-    let filenameTimestamp = `audio_${Date.now()}.wav`;
+    let filenameTimestamp = `adeus_wav_${Date.now()}.wav`;
 
     if (contentType.includes('multipart/form-data')) {
         const form = await multiParser(req);
@@ -37,7 +37,6 @@ const processAudio = async (req: Request) => {
 
   let transcript: string;
   try {
-    const filenameTimestamp = `adeus_wav_${Date.now()}.wav`;
     const wavFile = await toFile(arrayBuffer, filenameTimestamp);
 
     const transcriptResponse = await openaiClient.audio.transcriptions.create({
