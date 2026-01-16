@@ -378,8 +378,14 @@ void sendWavBufferBLE(const std::vector<char> &buffer)
         return;
     }
     
+    // Calculate packet info for BLE transmission
+    size_t mtu = bleServer->getMTU();
+    size_t headerSize = sizeof(BLEProtocol::AudioPacketHeader);
+    size_t dataPerPacket = mtu - headerSize;
+    uint16_t totalPackets = static_cast<uint16_t>((buffer.size() + dataPerPacket - 1) / dataPerPacket);
+    
     // Send raw audio data over BLE (phone app will handle WAV creation)
-    if (bleServer->sendAudioData(reinterpret_cast<const uint8_t*>(buffer.data()), buffer.size())) {
+    if (bleServer->sendAudioData(reinterpret_cast<const uint8_t*>(buffer.data()), buffer.size(), 0, totalPackets)) {
         std::cout << "Audio sent via BLE (" << buffer.size() << " bytes)" << std::endl;
     } else {
         std::cerr << "Failed to send audio via BLE" << std::endl;

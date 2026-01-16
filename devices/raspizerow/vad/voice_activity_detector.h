@@ -26,9 +26,11 @@ public:
         int minSpeechFrames = 5;          // Minimum frames to consider as speech
         int frameSize = 256;              // Samples per analysis frame
         bool enabled = true;
+        
+        Config() = default;  // Explicit default constructor for use in default argument
     };
 
-    VoiceActivityDetector(const Config& config = Config{})
+    VoiceActivityDetector(const Config& config = Config())
         : m_config(config)
         , m_noiseFloor(0.0f)
         , m_speechFrameCount(0)

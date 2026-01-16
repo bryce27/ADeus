@@ -2,6 +2,7 @@
 #define BLE_PROTOCOL_H
 
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <vector>
 
