@@ -9,19 +9,39 @@
 #include <fstream>
 #include "cxxopts.hpp"
 #include <chrono>
-#include <filesystem> // C++17 feature
+#include <filesystem>
+#include <atomic>
+#include <csignal>
+
+// Optional Bluetooth support (compile with -DENABLE_BLUETOOTH and link libbluetooth)
+#ifdef ENABLE_BLUETOOTH
+#include "bluetooth/ble_server.h"
+#endif
 
 #define DO_NOT_APPLY_GAIN 1.0
 
-// Assuming 4 bytes per sample for S32_LE format and mono audio
-int bytesPerSample = 4;
-short channels = 1;
-unsigned int sampleRate = 44100;
-int durationInSeconds = 60; // Duration you want to accumulate before sending
-int targetBytes = sampleRate * durationInSeconds * bytesPerSample * channels;
+// Configuration
+struct Config {
+    std::string audioDevice = "plughw:1,0";  // Default to USB mic
+    int bytesPerSample = 4;
+    short channels = 1;
+    unsigned int sampleRate = 44100;
+    int durationInSeconds = 60;
+    float audioGain = DO_NOT_APPLY_GAIN;
+    bool saveToLocalFile = false;
+    bool useBluetooth = false;
+    bool verbose = false;
+};
+
+Config config;
+std::atomic<bool> running{true};
 int rc;
-float audio_gain = DO_NOT_APPLY_GAIN;
-bool save_to_local_file = false;
+
+// Signal handler for graceful shutdown
+void signalHandler(int signum) {
+    std::cout << "\nShutting down..." << std::endl;
+    running = false;
+}
 
 template <typename T>
 class SafeQueue
@@ -42,8 +62,10 @@ public:
     T pop()
     {
         std::unique_lock<std::mutex> lock(mutex);
-        cond.wait(lock, [this]
-                  { return !queue.empty(); });
+        cond.wait(lock, [this] { return !queue.empty() || !running; });
+        if (!running && queue.empty()) {
+            return T();  // Return empty on shutdown
+        }
         T value = queue.front();
         queue.pop();
         return value;
@@ -54,41 +76,56 @@ public:
         std::lock_guard<std::mutex> lock(mutex);
         return queue.empty();
     }
+    
+    void notify_all()
+    {
+        cond.notify_all();
+    }
 };
+
 SafeQueue<std::vector<char>> audioQueue;
+
+#ifdef ENABLE_BLUETOOTH
+BLEServer* bleServer = nullptr;
+#endif
 
 void recordAudio(snd_pcm_t *capture_handle, snd_pcm_uframes_t period_size)
 {
-    std::vector<char> buffer(period_size * bytesPerSample);
+    int targetBytes = config.sampleRate * config.durationInSeconds * config.bytesPerSample * config.channels;
+    std::vector<char> buffer(period_size * config.bytesPerSample);
     std::vector<char> accumulatedBuffer;
 
-    while (true)
+    while (running)
     {
         rc = snd_pcm_readi(capture_handle, buffer.data(), period_size);
         if (rc == -EPIPE)
         {
-            // Handle overrun
             std::cerr << "Overrun occurred" << std::endl;
             snd_pcm_prepare(capture_handle);
         }
         else if (rc < 0)
         {
             std::cerr << "Error from read: " << snd_strerror(rc) << std::endl;
-            break; // Exit the loop on error
+            break;
         }
         else if (rc != (int)period_size)
         {
-            std::cerr << "Short read, read " << rc << " frames" << std::endl;
+            if (config.verbose) {
+                std::cerr << "Short read, read " << rc << " frames" << std::endl;
+            }
         }
         else
         {
-            // Append the captured data to the accumulated buffer
-            accumulatedBuffer.insert(accumulatedBuffer.end(), buffer.begin(), buffer.begin() + rc * bytesPerSample * channels);
+            accumulatedBuffer.insert(accumulatedBuffer.end(), buffer.begin(), 
+                                     buffer.begin() + rc * config.bytesPerSample * config.channels);
 
-            if (accumulatedBuffer.size() >= targetBytes)
+            if (accumulatedBuffer.size() >= static_cast<size_t>(targetBytes))
             {
                 audioQueue.push(accumulatedBuffer);
                 accumulatedBuffer.clear();
+                if (config.verbose) {
+                    std::cout << "Audio chunk ready for sending" << std::endl;
+                }
             }
         }
     }
@@ -96,93 +133,53 @@ void recordAudio(snd_pcm_t *capture_handle, snd_pcm_uframes_t period_size)
 
 void createWavHeader(std::vector<char> &header, int bitsPerSample, int dataSize)
 {
-    // "RIFF" chunk descriptor
     header.insert(header.end(), {'R', 'I', 'F', 'F'});
-
-    // Chunk size: 4 + (8 + SubChunk1Size) + (8 + SubChunk2Size)
     int chunkSize = 36 + dataSize;
     auto chunkSizeBytes = reinterpret_cast<const char *>(&chunkSize);
     header.insert(header.end(), chunkSizeBytes, chunkSizeBytes + 4);
-
-    // Format
     header.insert(header.end(), {'W', 'A', 'V', 'E'});
-
-    // "fmt " sub-chunk
     header.insert(header.end(), {'f', 'm', 't', ' '});
-
-    // Sub-chunk 1 size (16 for PCM)
     int subchunk1Size = 16;
     auto subchunk1SizeBytes = reinterpret_cast<const char *>(&subchunk1Size);
     header.insert(header.end(), subchunk1SizeBytes, subchunk1SizeBytes + 4);
-
-    // Audio format (PCM = 1)
     short audioFormat = 1;
     auto audioFormatBytes = reinterpret_cast<const char *>(&audioFormat);
     header.insert(header.end(), audioFormatBytes, audioFormatBytes + 2);
-
-    // Number of channels
-    auto channelsBytes = reinterpret_cast<const char *>(&channels);
+    auto channelsBytes = reinterpret_cast<const char *>(&config.channels);
     header.insert(header.end(), channelsBytes, channelsBytes + 2);
-
-    // Sample rate
-    auto sampleRateBytes = reinterpret_cast<const char *>(&sampleRate);
+    auto sampleRateBytes = reinterpret_cast<const char *>(&config.sampleRate);
     header.insert(header.end(), sampleRateBytes, sampleRateBytes + 4);
-
-    // Byte rate (SampleRate * NumChannels * BitsPerSample/8)
-    int byteRate = sampleRate * channels * bitsPerSample / 8;
+    int byteRate = config.sampleRate * config.channels * bitsPerSample / 8;
     auto byteRateBytes = reinterpret_cast<const char *>(&byteRate);
     header.insert(header.end(), byteRateBytes, byteRateBytes + 4);
-
-    // Block align (NumChannels * BitsPerSample/8)
-    short blockAlign = channels * bitsPerSample / 8;
+    short blockAlign = config.channels * bitsPerSample / 8;
     auto blockAlignBytes = reinterpret_cast<const char *>(&blockAlign);
     header.insert(header.end(), blockAlignBytes, blockAlignBytes + 2);
-
-    // Bits per sample
     auto bitsPerSampleBytes = reinterpret_cast<const char *>(&bitsPerSample);
     header.insert(header.end(), bitsPerSampleBytes, bitsPerSampleBytes + 2);
-
-    // "data" sub-chunk
     header.insert(header.end(), {'d', 'a', 't', 'a'});
-
-    // Sub-chunk 2 size (data size)
     auto dataSizeBytes = reinterpret_cast<const char *>(&dataSize);
     header.insert(header.end(), dataSizeBytes, dataSizeBytes + 4);
 }
 
 void saveWavToFile(const std::vector<char> &buffer)
 {
-    // Generate a timestamp for the filename
     auto now = std::chrono::system_clock::now();
     auto timestamp = std::chrono::system_clock::to_time_t(now);
-
-    // Convert the timestamp to a string
     std::string timestampStr = std::to_string(timestamp);
-
-    // Create the directory "data" if it doesn't exist
     std::filesystem::create_directory("data");
-
-    // Construct the filename with the timestamp
     std::string filename = "data/" + timestampStr + "_audio.wav";
-
-    // Write the buffer to the file
     std::ofstream outfile(filename, std::ios::binary);
     if (outfile.is_open())
     {
         outfile.write(buffer.data(), buffer.size());
         outfile.close();
+        std::cout << "Saved: " << filename << std::endl;
     }
 }
 
-void sendWavBuffer(const std::vector<char> &buffer)
+void sendWavBufferHTTP(const std::vector<char> &buffer)
 {
-    if (save_to_local_file)
-    {
-        saveWavToFile(buffer);
-    }
-
-    CURL *curl;
-    CURLcode res;
     const char *supabaseUrlEnv = getenv("SUPABASE_URL");
     if (!supabaseUrlEnv)
     {
@@ -190,12 +187,21 @@ void sendWavBuffer(const std::vector<char> &buffer)
         return;
     }
 
-    std::string url = std::string(supabaseUrlEnv) + "/functions/v1/process-audio";
-    std::string authToken = getenv("AUTH_TOKEN");
+    const char *authTokenEnv = getenv("AUTH_TOKEN");
+    if (!authTokenEnv)
+    {
+        std::cerr << "Environment variable AUTH_TOKEN is not set." << std::endl;
+        return;
+    }
 
-    // Initialize CURL
+    std::string url = std::string(supabaseUrlEnv) + "/functions/v1/process-audio";
+    std::string authToken = authTokenEnv;
+
+    CURL *curl;
+    CURLcode res;
     curl_global_init(CURL_GLOBAL_ALL);
     curl = curl_easy_init();
+    
     if (curl)
     {
         struct curl_slist *headers = NULL;
@@ -206,13 +212,18 @@ void sendWavBuffer(const std::vector<char> &buffer)
         curl_easy_setopt(curl, CURLOPT_POST, 1L);
         curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(buffer.size()));
         curl_easy_setopt(curl, CURLOPT_POSTFIELDS, buffer.data());
-        curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L); // Enable verbose for testing
+        
+        if (config.verbose) {
+            curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
+        }
 
         res = curl_easy_perform(curl);
-        if (res != CURLE_OK)
+        if (res != CURLE_OK) {
             std::cerr << "curl_easy_perform() failed: " << curl_easy_strerror(res) << std::endl;
+        } else {
+            std::cout << "Audio sent successfully" << std::endl;
+        }
 
-        // Cleanup
         curl_slist_free_all(headers);
         curl_easy_cleanup(curl);
     }
@@ -220,43 +231,74 @@ void sendWavBuffer(const std::vector<char> &buffer)
     curl_global_cleanup();
 }
 
+#ifdef ENABLE_BLUETOOTH
+void sendWavBufferBLE(const std::vector<char> &buffer)
+{
+    if (!bleServer || !bleServer->isConnected()) {
+        std::cerr << "BLE not connected, waiting..." << std::endl;
+        return;
+    }
+    
+    // Send raw audio data over BLE (phone app will handle WAV creation)
+    if (bleServer->sendAudioData(reinterpret_cast<const uint8_t*>(buffer.data()), buffer.size())) {
+        std::cout << "Audio sent via BLE (" << buffer.size() << " bytes)" << std::endl;
+    } else {
+        std::cerr << "Failed to send audio via BLE" << std::endl;
+    }
+}
+#endif
+
+void sendWavBuffer(const std::vector<char> &buffer)
+{
+    if (config.saveToLocalFile) {
+        saveWavToFile(buffer);
+    }
+
+#ifdef ENABLE_BLUETOOTH
+    if (config.useBluetooth) {
+        sendWavBufferBLE(buffer);
+        return;
+    }
+#endif
+    
+    sendWavBufferHTTP(buffer);
+}
+
 void handleAudioBuffer()
 {
-    while (true)
+    int targetBytes = config.sampleRate * config.durationInSeconds * config.bytesPerSample * config.channels;
+    
+    while (running)
     {
         std::vector<char> dataChunk;
-        // Accumulate our target bytes
-        while (dataChunk.size() < targetBytes)
+        
+        while (dataChunk.size() < static_cast<size_t>(targetBytes) && running)
         {
             std::vector<char> buffer = audioQueue.pop();
+            if (buffer.empty() && !running) break;
             dataChunk.insert(dataChunk.end(), buffer.begin(), buffer.end());
         }
 
-        if (audio_gain != DO_NOT_APPLY_GAIN)
+        if (!running) break;
+
+        if (config.audioGain != DO_NOT_APPLY_GAIN)
         {
-            // Apply volume increase by scaling the audio samples
-            for (size_t i = 0; i < dataChunk.size(); i += 2) // Assuming 16-bit (2-byte) audio samples
+            for (size_t i = 0; i < dataChunk.size(); i += 2)
             {
-                // Convert the two bytes to a short (16-bit sample)
                 short sample = static_cast<short>((dataChunk[i + 1] << 8) | dataChunk[i]);
-                // Scale the sample by the volume factor
-                sample = static_cast<short>(std::min(std::max(-32768, static_cast<int>(audio_gain * sample)), 32767));
-                // Split the short back into two bytes
+                sample = static_cast<short>(std::min(std::max(-32768, static_cast<int>(config.audioGain * sample)), 32767));
                 dataChunk[i] = sample & 0xFF;
                 dataChunk[i + 1] = (sample >> 8) & 0xFF;
             }
         }
 
-        // Process and send the accumulated data
         if (!dataChunk.empty())
         {
-            // Create the WAV header in memory
             std::vector<char> wavHeader;
             int bitsPerSample = 32;
             int dataSize = dataChunk.size();
             createWavHeader(wavHeader, bitsPerSample, dataSize);
 
-            // Combine the header and the data into a single buffer
             std::vector<char> wavBuffer;
             wavBuffer.reserve(wavHeader.size() + dataSize);
             wavBuffer.insert(wavBuffer.end(), wavHeader.begin(), wavHeader.end());
@@ -267,48 +309,138 @@ void handleAudioBuffer()
     }
 }
 
-void process_args(int argc, char *argv[])
+void printBanner()
 {
-    cxxopts::Options options("main", " - command line options");
+    std::cout << R"(
+    _    ____                  
+   / \  |  _ \  ___ _   _ ___ 
+  / _ \ | | | |/ _ \ | | / __|
+ / ___ \| |_| |  __/ |_| \__ \
+/_/   \_\____/ \___|\__,_|___/
+                              
+)" << std::endl;
+    std::cout << "ADeus Raspberry Pi Zero Audio Recorder" << std::endl;
+    std::cout << "=======================================" << std::endl;
+}
 
-    options.add_options()("h,help", "Print help")("s,save", "Save audio to local file")("g,gain", "Microphone gain (increase volume of audio)", cxxopts::value<float>());
+Config process_args(int argc, char *argv[])
+{
+    Config cfg;
+    cxxopts::Options options("adeus", "ADeus Raspberry Pi Zero Audio Recorder");
+
+    options.add_options()
+        ("h,help", "Print help")
+        ("s,save", "Save audio to local file")
+        ("g,gain", "Microphone gain (volume multiplier)", cxxopts::value<float>())
+        ("d,device", "ALSA audio device (default: plughw:1,0)", cxxopts::value<std::string>())
+        ("r,rate", "Sample rate in Hz (default: 44100)", cxxopts::value<unsigned int>())
+        ("t,duration", "Recording duration per chunk in seconds (default: 60)", cxxopts::value<int>())
+#ifdef ENABLE_BLUETOOTH
+        ("b,bluetooth", "Use Bluetooth LE instead of WiFi")
+#endif
+        ("v,verbose", "Enable verbose output");
 
     auto result = options.parse(argc, argv);
 
     if (result.count("help"))
     {
         std::cout << options.help() << std::endl;
+        std::cout << "\nEnvironment variables:" << std::endl;
+        std::cout << "  SUPABASE_URL  - Your Supabase project URL" << std::endl;
+        std::cout << "  AUTH_TOKEN    - Your Supabase anon key" << std::endl;
+        std::cout << "\nExamples:" << std::endl;
+        std::cout << "  ./main                           # Use defaults (USB mic, WiFi)" << std::endl;
+        std::cout << "  ./main -d plughw:0,0             # Use built-in audio" << std::endl;
+        std::cout << "  ./main -d plughw:1,0 -g 2.0      # USB mic with 2x gain" << std::endl;
+        std::cout << "  ./main --save                    # Also save audio locally" << std::endl;
+#ifdef ENABLE_BLUETOOTH
+        std::cout << "  ./main --bluetooth               # Use BLE instead of WiFi" << std::endl;
+#endif
         exit(0);
     }
 
-    if (result.count("save"))
-    {
-        std::cout << "Saving audio to local file" << std::endl;
-        save_to_local_file = true;
+    if (result.count("save")) {
+        cfg.saveToLocalFile = true;
     }
 
-    if (result.count("gain"))
-    {
-        float gain = result["gain"].as<float>();
-        std::cout << "Microphone gain: " << gain << std::endl;
-        audio_gain = gain;
+    if (result.count("gain")) {
+        cfg.audioGain = result["gain"].as<float>();
     }
+
+    if (result.count("device")) {
+        cfg.audioDevice = result["device"].as<std::string>();
+    }
+
+    if (result.count("rate")) {
+        cfg.sampleRate = result["rate"].as<unsigned int>();
+    }
+
+    if (result.count("duration")) {
+        cfg.durationInSeconds = result["duration"].as<int>();
+    }
+
+#ifdef ENABLE_BLUETOOTH
+    if (result.count("bluetooth")) {
+        cfg.useBluetooth = true;
+    }
+#endif
+
+    if (result.count("verbose")) {
+        cfg.verbose = true;
+    }
+
+    return cfg;
 }
 
 int main(int argc, char *argv[])
 {
-    process_args(argc, argv);
+    // Set up signal handlers
+    signal(SIGINT, signalHandler);
+    signal(SIGTERM, signalHandler);
+    
+    printBanner();
+    config = process_args(argc, argv);
+    
+    // Print configuration
+    std::cout << "\nConfiguration:" << std::endl;
+    std::cout << "  Audio device:    " << config.audioDevice << std::endl;
+    std::cout << "  Sample rate:     " << config.sampleRate << " Hz" << std::endl;
+    std::cout << "  Chunk duration:  " << config.durationInSeconds << " seconds" << std::endl;
+    std::cout << "  Audio gain:      " << config.audioGain << "x" << std::endl;
+    std::cout << "  Save locally:    " << (config.saveToLocalFile ? "yes" : "no") << std::endl;
+#ifdef ENABLE_BLUETOOTH
+    std::cout << "  Mode:            " << (config.useBluetooth ? "Bluetooth LE" : "WiFi/HTTP") << std::endl;
+#else
+    std::cout << "  Mode:            WiFi/HTTP" << std::endl;
+#endif
+    std::cout << std::endl;
+
+#ifdef ENABLE_BLUETOOTH
+    // Start BLE server if bluetooth mode
+    if (config.useBluetooth) {
+        bleServer = new BLEServer();
+        if (!bleServer->start("ADeus-Pi")) {
+            std::cerr << "Failed to start BLE server" << std::endl;
+            return 1;
+        }
+        std::cout << "Waiting for BLE connection from phone app..." << std::endl;
+    }
+#endif
+
+    // Open PCM device for recording
     snd_pcm_t *capture_handle;
     snd_pcm_format_t format = SND_PCM_FORMAT_S32_LE;
 
-    // Open PCM device for recording (use plughw:1,0 for USB mic)
-    rc = snd_pcm_open(&capture_handle, "plughw:1,0", SND_PCM_STREAM_CAPTURE, 0);
+    rc = snd_pcm_open(&capture_handle, config.audioDevice.c_str(), SND_PCM_STREAM_CAPTURE, 0);
     if (rc < 0)
     {
-        std::cerr << "Unable to open pcm device: " << snd_strerror(rc) << std::endl;
-        std::cerr << "Tip: Run 'arecord -l' to list available devices" << std::endl;
+        std::cerr << "Unable to open PCM device '" << config.audioDevice << "': " << snd_strerror(rc) << std::endl;
+        std::cerr << "\nTip: Run 'arecord -l' to list available capture devices" << std::endl;
+        std::cerr << "     Common devices: plughw:0,0 (built-in), plughw:1,0 (USB)" << std::endl;
         return 1;
     }
+
+    std::cout << "Opened audio device: " << config.audioDevice << std::endl;
 
     // Set PCM parameters
     snd_pcm_uframes_t buffer_size;
@@ -317,8 +449,8 @@ int main(int argc, char *argv[])
     rc = snd_pcm_set_params(capture_handle,
                             format,
                             SND_PCM_ACCESS_RW_INTERLEAVED,
-                            channels,
-                            sampleRate,
+                            config.channels,
+                            config.sampleRate,
                             1,       // allow software resampling
                             500000); // desired latency
 
@@ -328,27 +460,34 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    // After calling snd_pcm_set_params, you can query the actual buffer size and period size set by ALSA
     snd_pcm_get_params(capture_handle, &buffer_size, &period_size);
-    std::vector<char> buffer(period_size * bytesPerSample);
-
-    // Prepare to use the capture handle
     snd_pcm_prepare(capture_handle);
 
-    // Start the recording thread
-    std::thread recordingThread(recordAudio, capture_handle, period_size);
+    std::cout << "Recording started! Press Ctrl+C to stop." << std::endl;
+    std::cout << std::endl;
 
-    // Start the sending thread
+    // Start threads
+    std::thread recordingThread(recordAudio, capture_handle, period_size);
     std::thread sendingThread(handleAudioBuffer);
 
+    // Wait for threads
     recordingThread.join();
+    
+    // Wake up the sending thread
+    audioQueue.notify_all();
     sendingThread.join();
 
-    // Stop PCM device and drop pending frames
+    // Cleanup
     snd_pcm_drop(capture_handle);
-
-    // Close PCM device
     snd_pcm_close(capture_handle);
 
+#ifdef ENABLE_BLUETOOTH
+    if (bleServer) {
+        bleServer->stop();
+        delete bleServer;
+    }
+#endif
+
+    std::cout << "Goodbye!" << std::endl;
     return 0;
 }
