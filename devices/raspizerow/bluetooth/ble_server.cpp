@@ -49,12 +49,12 @@ bool BLEServer::start(const std::string& deviceName) {
         std::cerr << "Warning: Failed to set security level: " << strerror(errno) << std::endl;
     }
     
-    // Bind to BLE PSM
+    // Bind to BLE ATT CID (PSM must be 0 when using fixed CID)
     struct sockaddr_l2 loc_addr = {0};
     loc_addr.l2_family = AF_BLUETOOTH;
     loc_addr.l2_bdaddr = {{0, 0, 0, 0, 0, 0}};  // BDADDR_ANY
-    loc_addr.l2_psm = htobs(0x25);  // Dynamic PSM for BLE
-    loc_addr.l2_cid = htobs(4);     // ATT CID
+    loc_addr.l2_psm = 0;                         // Must be 0 for fixed CID
+    loc_addr.l2_cid = htobs(4);                  // ATT CID for BLE
     loc_addr.l2_bdaddr_type = BDADDR_LE_PUBLIC;
     
     if (bind(m_serverSocket, (struct sockaddr *)&loc_addr, sizeof(loc_addr)) < 0) {
