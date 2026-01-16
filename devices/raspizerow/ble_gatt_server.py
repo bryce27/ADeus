@@ -3,6 +3,11 @@
 ADeus BLE GATT Server for Raspberry Pi Zero W
 Works with Chrome Web Bluetooth API
 
+This script:
+1. Runs the C++ audio recorder (./main) as a subprocess
+2. Monitors for new audio files
+3. Streams audio to connected Chrome clients via BLE
+
 Requires: sudo apt install python3-dbus python3-gi
 Run with: sudo python3 ble_gatt_server.py
 """
@@ -19,11 +24,19 @@ import subprocess
 import sys
 import os
 import signal
+import glob
+from pathlib import Path
+from datetime import datetime
 
 try:
     from gi.repository import GLib
 except ImportError:
     import glib as GLib
+
+# Get the directory where this script is located
+SCRIPT_DIR = Path(__file__).parent.absolute()
+DATA_DIR = SCRIPT_DIR / 'data'
+MAIN_BINARY = SCRIPT_DIR / 'build' / 'main'
 
 BLUEZ_SERVICE_NAME = 'org.bluez'
 GATT_MANAGER_IFACE = 'org.bluez.GattManager1'
@@ -444,6 +457,146 @@ class StatusCharacteristic(Characteristic):
         print('Status notifications disabled')
 
 
+class AudioRecorderManager:
+    """Manages the C++ audio recorder subprocess and monitors for new audio files"""
+    
+    def __init__(self, audio_characteristic, status_characteristic):
+        self.audio_char = audio_characteristic
+        self.status_char = status_characteristic
+        self.recorder_process = None
+        self.monitor_thread = None
+        self.running = False
+        self.recording = False
+        self.processed_files = set()
+        self.bytes_recorded = 0
+        self.start_time = time.time()
+        
+    def start(self):
+        """Start the audio recorder and file monitor"""
+        self.running = True
+        self.start_time = time.time()
+        
+        # Create data directory if it doesn't exist
+        DATA_DIR.mkdir(exist_ok=True)
+        
+        # Get list of existing files to ignore
+        for f in DATA_DIR.glob('*.wav'):
+            self.processed_files.add(str(f))
+        
+        # Start file monitor thread
+        self.monitor_thread = threading.Thread(target=self._monitor_files, daemon=True)
+        self.monitor_thread.start()
+        
+        # Start the recorder
+        self.start_recording()
+        
+        print(f'AudioRecorderManager started, monitoring {DATA_DIR}')
+        
+    def stop(self):
+        """Stop the recorder and monitor"""
+        self.running = False
+        self.stop_recording()
+        
+    def start_recording(self):
+        """Start the C++ recorder subprocess"""
+        if self.recorder_process is not None:
+            return
+            
+        if not MAIN_BINARY.exists():
+            print(f'ERROR: Recorder binary not found at {MAIN_BINARY}')
+            print('Please compile first: ./compile.sh')
+            return
+            
+        print('Starting audio recorder...')
+        try:
+            # Run the recorder without bluetooth (we handle BLE in Python)
+            self.recorder_process = subprocess.Popen(
+                [str(MAIN_BINARY), '--save', '--verbose'],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                cwd=str(SCRIPT_DIR)
+            )
+            self.recording = True
+            self.status_char.update_status(state=1)  # Recording
+            
+            # Start a thread to log recorder output
+            threading.Thread(target=self._log_recorder_output, daemon=True).start()
+            
+            print(f'Recorder started (PID: {self.recorder_process.pid})')
+        except Exception as e:
+            print(f'Failed to start recorder: {e}')
+            
+    def stop_recording(self):
+        """Stop the C++ recorder subprocess"""
+        if self.recorder_process is None:
+            return
+            
+        print('Stopping audio recorder...')
+        self.recorder_process.terminate()
+        try:
+            self.recorder_process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.recorder_process.kill()
+        self.recorder_process = None
+        self.recording = False
+        self.status_char.update_status(state=0)  # Stopped
+        print('Recorder stopped')
+        
+    def _log_recorder_output(self):
+        """Log output from the recorder subprocess"""
+        if self.recorder_process is None:
+            return
+        for line in self.recorder_process.stdout:
+            if not self.running:
+                break
+            line = line.decode('utf-8', errors='replace').strip()
+            if line:
+                print(f'[recorder] {line}')
+                
+    def _monitor_files(self):
+        """Monitor the data directory for new audio files"""
+        while self.running:
+            try:
+                # Check for new WAV files
+                for filepath in DATA_DIR.glob('*.wav'):
+                    filepath_str = str(filepath)
+                    if filepath_str not in self.processed_files:
+                        # Wait a bit to ensure file is fully written
+                        time.sleep(0.5)
+                        self._process_audio_file(filepath)
+                        self.processed_files.add(filepath_str)
+            except Exception as e:
+                print(f'Error monitoring files: {e}')
+                
+            time.sleep(1)  # Check every second
+            
+            # Update uptime in status
+            uptime = int(time.time() - self.start_time)
+            self.status_char.update_status(
+                uptime=uptime,
+                bytes_recorded=self.bytes_recorded
+            )
+            
+    def _process_audio_file(self, filepath):
+        """Process a new audio file and send via BLE"""
+        try:
+            file_size = filepath.stat().st_size
+            print(f'New audio file: {filepath.name} ({file_size} bytes)')
+            
+            self.bytes_recorded += file_size
+            
+            # Read the file
+            with open(filepath, 'rb') as f:
+                audio_data = f.read()
+                
+            # Queue for BLE transmission
+            self.audio_char.queue_audio(audio_data)
+            print(f'Queued {len(audio_data)} bytes for BLE transmission')
+            
+        except Exception as e:
+            print(f'Error processing audio file: {e}')
+
+
 def find_adapter(bus):
     """Find the Bluetooth adapter"""
     remote_om = dbus.Interface(bus.get_object(BLUEZ_SERVICE_NAME, '/'),
@@ -480,7 +633,19 @@ mainloop = None
 def main():
     global mainloop
 
+    print('')
+    print('    _    ____')
+    print('   / \\  |  _ \\  ___ _   _ ___')
+    print('  / _ \\ | | | |/ _ \\ | | / __|')
+    print(' / ___ \\| |_| |  __/ |_| \\__ \\')
+    print('/_/   \\_\\____/ \\___|\\__,_|___/')
+    print('')
+    print('ADeus BLE GATT Server + Audio Recorder')
+    print('=' * 45)
+    print('')
+
     # Make sure bluetooth service is running
+    print('Starting Bluetooth service...')
     subprocess.run(['sudo', 'systemctl', 'start', 'bluetooth'], capture_output=True)
     time.sleep(1)
     
@@ -523,6 +688,29 @@ def main():
     adeus_service = ADeusService(bus, 0)
     app.add_service(adeus_service)
 
+    # Get references to characteristics for the recorder manager
+    audio_char = adeus_service.characteristics[0]  # AudioCharacteristic
+    control_char = adeus_service.characteristics[1]  # ControlCharacteristic
+    status_char = adeus_service.characteristics[2]  # StatusCharacteristic
+
+    # Create the audio recorder manager
+    recorder_manager = AudioRecorderManager(audio_char, status_char)
+
+    # Set up control command handling
+    def handle_command(cmd, data):
+        if cmd == ControlCharacteristic.CMD_START_RECORDING:
+            recorder_manager.start_recording()
+        elif cmd == ControlCharacteristic.CMD_STOP_RECORDING:
+            recorder_manager.stop_recording()
+        elif cmd == ControlCharacteristic.CMD_PAUSE_RECORDING:
+            # TODO: Implement pause
+            pass
+        elif cmd == ControlCharacteristic.CMD_RESUME_RECORDING:
+            # TODO: Implement resume
+            pass
+
+    control_char.set_command_callback(handle_command)
+
     # Create advertisement
     advertisement = ADeusAdvertisement(bus, 0)
 
@@ -554,12 +742,26 @@ def main():
     print(f'  Control (write): {CONTROL_CHAR_UUID}')
     print(f'  Status (read):   {STATUS_CHAR_UUID}')
     print('')
-    print('Waiting for connections from Chrome...')
+    
+    # Check if recorder binary exists
+    if MAIN_BINARY.exists():
+        print(f'Recorder binary: {MAIN_BINARY}')
+    else:
+        print(f'WARNING: Recorder binary not found at {MAIN_BINARY}')
+        print('         Run ./compile.sh first to build the recorder')
+    
+    print('')
+    print('Starting audio recorder and file monitor...')
+    recorder_manager.start()
+    
+    print('')
+    print('Waiting for BLE connections from Chrome...')
     print('Press Ctrl+C to stop')
     print('')
 
     def signal_handler(sig, frame):
         print('\nShutting down...')
+        recorder_manager.stop()
         mainloop.quit()
 
     signal.signal(signal.SIGINT, signal_handler)
@@ -570,6 +772,7 @@ def main():
     except KeyboardInterrupt:
         pass
 
+    recorder_manager.stop()
     print('Server stopped')
     return 0
 

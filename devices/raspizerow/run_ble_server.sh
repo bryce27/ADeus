@@ -1,26 +1,24 @@
 #!/bin/bash
-# Run the ADeus BLE GATT Server for Chrome Web Bluetooth
+# Run the ADeus BLE GATT Server + Audio Recorder
+# This single command handles everything:
+#   - BLE GATT server for Chrome Web Bluetooth
+#   - Audio recording via the C++ recorder
+#   - Streaming audio to connected clients
 
-echo "ADeus BLE GATT Server"
-echo "====================="
-echo ""
+SCRIPT_DIR="$(dirname "$0")"
 
 # Check for required packages
 if ! python3 -c "import dbus" 2>/dev/null; then
-    echo "Installing required packages..."
+    echo "Installing required Python packages..."
     sudo apt-get update
     sudo apt-get install -y python3-dbus python3-gi
 fi
 
-# Make sure bluetooth is running
-echo "Starting Bluetooth service..."
-sudo systemctl start bluetooth
-sleep 1
+# Check if recorder is compiled
+if [ ! -f "$SCRIPT_DIR/build/main" ]; then
+    echo "Recorder not compiled. Building now..."
+    "$SCRIPT_DIR/compile.sh"
+fi
 
-# Power on the adapter
-sudo hciconfig hci0 up 2>/dev/null
-
-# Run the GATT server
-echo "Starting GATT server..."
-echo ""
-sudo python3 "$(dirname "$0")/ble_gatt_server.py"
+# Run the integrated GATT server + recorder
+sudo python3 "$SCRIPT_DIR/ble_gatt_server.py"
