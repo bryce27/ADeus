@@ -7,13 +7,14 @@
 #include <functional>
 #include <atomic>
 #include <thread>
-
-// BLE Service and Characteristic UUIDs (same as ESP32 for app compatibility)
-#define ADEUS_SERVICE_UUID "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
-#define ADEUS_AUDIO_CHAR_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+#include <mutex>
+#include "ble_protocol.h"
 
 class BLEServer {
 public:
+    using CommandCallback = std::function<void(BLEProtocol::Command, const uint8_t*, size_t)>;
+    using ConnectionCallback = std::function<void(bool connected)>;
+    
     BLEServer();
     ~BLEServer();
     
@@ -24,13 +25,17 @@ public:
     void stop();
     
     // Send audio data to connected client
-    bool sendAudioData(const uint8_t* data, size_t length);
+    bool sendAudioData(const uint8_t* data, size_t length, uint16_t seqNum, uint16_t totalPackets);
+    
+    // Send status update
+    bool sendStatus(const BLEProtocol::StatusPacket& status);
     
     // Check if a client is connected
     bool isConnected() const;
     
-    // Set connection callback
-    void setConnectionCallback(std::function<void(bool)> callback);
+    // Set callbacks
+    void setConnectionCallback(ConnectionCallback callback);
+    void setCommandCallback(CommandCallback callback);
     
     // Get MTU size
     size_t getMTU() const;
@@ -38,13 +43,16 @@ public:
 private:
     std::atomic<bool> m_connected{false};
     std::atomic<bool> m_running{false};
-    std::function<void(bool)> m_connectionCallback;
+    ConnectionCallback m_connectionCallback;
+    CommandCallback m_commandCallback;
     std::thread m_serverThread;
+    std::mutex m_sendMutex;
     int m_serverSocket{-1};
     int m_clientSocket{-1};
-    size_t m_mtu{185}; // Default MTU matching ESP32
+    size_t m_mtu{185};
     
     void serverLoop();
+    void handleClientData(const uint8_t* data, size_t len);
 };
 
 #endif // BLE_SERVER_H

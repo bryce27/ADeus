@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from 'react';
 import { toast } from 'sonner';
 import { useSupabaseConfig } from '../utils/useSupabaseConfig';
 import ChatLog, { Message } from './ChatLog';
+import DeviceControl from './DeviceControl';
 import LogoutButton from './LogoutButton';
 import { NavMenu } from './NavMenu';
 import NewConversationButton from './NewConversationButton';
@@ -26,6 +27,7 @@ export default function Chat({
   const [isStreaming, setIsStreaming] = useState(false);
 
   const { supabaseUrl, supabaseToken } = useSupabaseConfig();
+  const [showDevicePanel, setShowDevicePanel] = useState(false);
 
   const sendMessageAndReceiveResponse = useMutation({
     mutationFn: async (userMessage: Message) => {
@@ -207,6 +209,15 @@ export default function Chat({
       </div>
       <div className="fixed right-4 top-4 flex space-x-4">
         <NavMenu>
+          <button
+            onClick={() => setShowDevicePanel(!showDevicePanel)}
+            className="flex w-full items-center rounded-md px-2 py-1.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-800"
+          >
+            <svg className="mr-2 h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 2l4 4-4 4m0 0l4 4-4 4m0-8V2m0 20v-8" />
+            </svg>
+            {showDevicePanel ? 'Hide Device' : 'Device Control'}
+          </button>
           <LogoutButton supabaseClient={supabaseClient} />
           <NewConversationButton
             createNewConversation={() => {
@@ -216,6 +227,16 @@ export default function Chat({
           <ThemeToggle />
         </NavMenu>
       </div>
+
+      {/* Device Control Panel */}
+      {showDevicePanel && (
+        <div className="fixed right-4 top-16 z-50 w-80">
+          <DeviceControl
+            supabaseUrl={supabaseUrl}
+            supabaseToken={supabaseToken}
+          />
+        </div>
+      )}
 
       <div className="mb-32 mt-12 p-4 md:p-8">
         <ChatLog messages={messages} waitingForResponse={waitingForResponse} />
